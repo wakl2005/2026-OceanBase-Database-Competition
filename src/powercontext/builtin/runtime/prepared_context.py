@@ -17,7 +17,10 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from collections.abc import Sequence
+from collections import Counter
 from dataclasses import dataclass, replace
 from itertools import chain
 from typing import TypeVar
@@ -106,6 +109,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +119,16 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class PreparedContextFragment:
+    """One literal span of a Memory entry body selected for the current query."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -228,6 +242,25 @@ class PreparedContextBuilder:
 
             return assemble_code(request, code_candidates, self.entry_limit, historical)
 
+        if request.evidence_selection:
+            content, origins, omissions, fragments = self._select_fragments(
+                request=request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
+            if content is None:
+                return PreparedContextBuild(context=self.empty(), origins=(), omissions=omissions)
+            return PreparedContextBuild(
+                context=PreparedContext(
+                    status="ready",
+                    content=content,
+                    content_bytes=len(content.encode("utf-8")),
+                ),
+                origins=origins,
+                omissions=omissions,
+                fragments=fragments,
+            )
+
         if sum(len(candidates.hits) for candidates in memory_candidates) > self.memory_candidate_limit:
             raise PreparedContextInvariantError("memory-candidate-limit")
         if len(topic_memory_hits) > self.topic_memory_candidate_limit:
@@ -255,6 +288,60 @@ class PreparedContextBuilder:
             origins=origins,
             omissions=omissions,
         )
+
+    def _select_fragments(
+        self,
+        *,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> tuple[
+        str | None,
+        tuple[PreparedContextOrigin, ...],
+        tuple[PreparedContextFragment, ...],
+        PreparedContextOmissions,
+    ]:
+        """Select literal query-relevant spans from the retrieved Memory bodies."""
+
+        omissions = PreparedContextOmissions()
+        spans: list[_EvidenceSpan] = []
+        order = 0
+        for candidates in memory_candidates:
+            scope_id = candidates.scope_id or current_scope_id or ""
+            for hit in candidates.hits:
+                if not hit.text.strip():
+                    continue
+                for start, end in _sentence_spans(hit.text):
+                    if len(_EVIDENCE_TOKEN.findall(hit.text[start:end].lower())) < 3:
+                        continue
+                    spans.append(
+                        _EvidenceSpan(order=order, scope_id=scope_id, hit=hit, start=start, end=end)
+                    )
+                    order += 1
+        if not spans:
+            return None, (), (), omissions
+        _score_evidence_spans(spans, request.query)
+        best = max(span.score for span in spans)
+        floor = best * 0.4
+        ranked = sorted(
+            (span for span in spans if span.score >= floor and span.score > 0),
+            key=lambda span: (-span.score, span.order),
+        )
+        if not ranked:
+            ranked = [spans[0]]
+        items: list[_EvidenceItem] = []
+        fragments: list[PreparedContextFragment] = []
+        origins: list[PreparedContextOrigin] = []
+        for span in ranked:
+            item = _evidence_item(span)
+            if len(_render_evidence((*items, item)).encode("utf-8")) > request.max_bytes:
+                continue
+            items.append(item)
+            fragments.append(item.fragment)
+            origins.append(item.origin)
+        if not items:
+            return None, (), (), omissions
+        return _render_evidence(items), tuple(origins), omissions, tuple(fragments)
 
     def probe_budget(
         self,
@@ -728,3 +815,205 @@ def _truncate_utf8(text: str, byte_budget: int) -> str:
     prefix_budget = byte_budget - len(_ELLIPSIS.encode("utf-8"))
     encoded_prefix = text.encode("utf-8")[:prefix_budget]
     return f"{encoded_prefix.decode('utf-8', errors='ignore')}{_ELLIPSIS}"
+
+
+_EVIDENCE_TOKEN = re.compile(r"[a-z0-9]+")
+_EVIDENCE_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "been",
+        "but",
+        "by",
+        "can",
+        "did",
+        "do",
+        "does",
+        "for",
+        "from",
+        "had",
+        "has",
+        "have",
+        "how",
+        "in",
+        "into",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "our",
+        "than",
+        "that",
+        "the",
+        "their",
+        "them",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "to",
+        "was",
+        "we",
+        "were",
+        "what",
+        "when",
+        "which",
+        "who",
+        "will",
+        "with",
+        "would",
+        "you",
+        "your",
+    }
+)
+
+
+@dataclass(slots=True)
+class _EvidenceSpan:
+    """One candidate span of a retrieved Memory body."""
+
+    order: int
+    scope_id: str
+    hit: MemoryHit
+    start: int
+    end: int
+    score: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class _EvidenceItem:
+    """One selected span with its exact citation identity."""
+
+    citation: dict[str, object]
+    content: str
+    start: int
+    end: int
+    origin: MemoryEntryAddress
+    fragment: PreparedContextFragment
+
+
+def _evidence_item(span: _EvidenceSpan) -> _EvidenceItem:
+    hit = span.hit
+    address = MemoryEntryAddress(
+        memory=ArtifactAddress(scope_id=span.scope_id, artifact=hit.memory_ref),
+        entry_id=hit.entry_id,
+        entry_version_id=hit.entry_version_id,
+    )
+    text = hit.text[span.start : span.end]
+    return _EvidenceItem(
+        citation={
+            "scope_id": span.scope_id,
+            "memory_ref": hit.memory_ref.model_dump(mode="json"),
+            "entry_id": hit.entry_id,
+            "entry_version_id": hit.entry_version_id,
+        },
+        content=text,
+        start=span.start,
+        end=span.end,
+        origin=address,
+        fragment=PreparedContextFragment(
+            address=address,
+            start=span.start,
+            end=span.end,
+            text=text,
+        ),
+    )
+
+
+def _render_evidence(items: Sequence[_EvidenceItem]) -> str:
+    """Render the selected spans inside the standard prepared-context envelope."""
+
+    envelope = {
+        "trust": "untrusted_history",
+        "items": [
+            {
+                "citation": item.citation,
+                "content": item.content,
+                "start": item.start,
+                "end": item.end,
+            }
+            for item in items
+        ],
+    }
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _sentence_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Split one body into literal sentence spans with their character offsets."""
+
+    spans: list[tuple[int, int]] = []
+    position = 0
+    length = len(text)
+    while position < length:
+        end = position
+        while end < length and text[end] not in ".!?\n":
+            end += 1
+        if end < length and text[end] in ".!?":
+            # A decimal point inside a number is not a sentence boundary.
+            if not (
+                text[end] == "."
+                and end > position
+                and text[end - 1].isdigit()
+                and end + 1 < length
+                and text[end + 1].isdigit()
+            ):
+                end += 1
+        raw = text[position:end]
+        stripped = raw.strip()
+        if stripped:
+            offset = len(raw) - len(raw.lstrip())
+            spans.append((position + offset, position + offset + len(stripped)))
+        position = end
+    return tuple(spans)
+
+
+def _evidence_terms(query: str) -> tuple[str, ...]:
+    """Return the distinct content terms of one query."""
+
+    return tuple(
+        dict.fromkeys(
+            token
+            for token in _EVIDENCE_TOKEN.findall(query.lower())
+            if token not in _EVIDENCE_STOPWORDS
+        )
+    )
+
+
+def _score_evidence_spans(spans: list[_EvidenceSpan], query: str) -> None:
+    """Score every span by the inverse-frequency query terms it contains."""
+
+    terms = _evidence_terms(query)
+    if not terms:
+        return
+    documents = [
+        frozenset(_EVIDENCE_TOKEN.findall(span.hit.text[span.start : span.end].lower()))
+        for span in spans
+    ]
+    frequency: Counter[str] = Counter()
+    for document in documents:
+        frequency.update(document.intersection(terms))
+    total = len(documents)
+    bigrams = tuple(
+        (terms[index], terms[index + 1]) for index in range(len(terms) - 1)
+    )
+    lowered = [span.hit.text[span.start : span.end].lower() for span in spans]
+    for index, span in enumerate(spans):
+        document = documents[index]
+        score = sum(
+            math.log((1 + total) / (1 + frequency.get(term, 0)))
+            for term in terms
+            if term in document
+        )
+        for left, right in bigrams:
+            if f"{left} {right}" in lowered[index]:
+                score += math.log((1 + total) / (1 + frequency.get(left, 0)))
+        span.score = score
