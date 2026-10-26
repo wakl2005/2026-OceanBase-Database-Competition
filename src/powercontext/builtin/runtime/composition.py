@@ -435,7 +435,11 @@ async def open_builtin_runtime(
         configured_experience = generated_experience if experience_generator is None else experience_generator
         configured_skill = generated_skill if skill_generator is None else skill_generator
         configured_handoff = generated_handoff if handoff_pipeline is None else handoff_pipeline
-        configured_reranker = generated_reranker if memory_reranker is None else memory_reranker
+        configured_reranker = (
+            memory_reranker
+            if memory_reranker is not None
+            else (config.memory_reranker if config.memory_reranker is not None else generated_reranker)
+        )
         components = (
             ("profile.generate", profile_generator, generated_profile),
             ("memory.extract", candidate_pipeline, generated_memory),
@@ -880,6 +884,7 @@ async def open_builtin_contexts(
 
     database = config.database
     configured_token_estimator = character_token_estimator() if token_estimator is None else token_estimator
+    configured_memory_reranker = memory_reranker if memory_reranker is not None else config.memory_reranker
     if isinstance(database, SQLiteConfig):
         experience_index = SQLiteExperienceFTSIndex()
         indexes: list[MemoryIndex] = [SQLiteMemoryFTSIndex()]
@@ -925,7 +930,7 @@ async def open_builtin_contexts(
                 handoff_pipeline=handoff_pipeline,
                 embedding_model=embedding_model,
                 token_estimator=configured_token_estimator,
-                memory_reranker=memory_reranker,
+                memory_reranker=configured_memory_reranker,
                 decision_model=decision_model,
                 memory_write_gate=memory_write_gate,
                 memory_rerank_candidate_limit=config.runtime.memory_rerank_candidate_limit,
@@ -1002,7 +1007,7 @@ async def open_builtin_contexts(
             handoff_pipeline=handoff_pipeline,
             embedding_model=embedding_model,
             token_estimator=configured_token_estimator,
-            memory_reranker=memory_reranker,
+            memory_reranker=configured_memory_reranker,
             decision_model=decision_model,
             memory_write_gate=memory_write_gate,
             memory_rerank_candidate_limit=config.runtime.memory_rerank_candidate_limit,

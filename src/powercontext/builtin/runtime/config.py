@@ -33,6 +33,7 @@ from pydantic import (
 )
 
 from powercontext.builtin.artifacts.memory.prompts import MemoryExtractionProfile
+from powercontext.builtin.artifacts.memory.reranking import MemoryReranker
 from powercontext.builtin.artifacts.skill import AgentSkillTarget, CodexSkillRoot
 from powercontext.builtin.artifacts.topic_memory import MAX_TOPIC_MEMORY_SEARCH_LIMIT
 from powercontext.builtin.artifacts.topic_memory.generation import (
@@ -446,12 +447,15 @@ def normalize_database_discriminator(value: Any) -> Any:
 class BuiltinConfig(BaseModel):
     """Configuration for one built-in runtime and its database."""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     code: CodeConfig = Field(default_factory=CodeConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     database: DatabaseConfig = Field(default_factory=SQLiteConfig, discriminator="kind")
     handoff_report: HandoffReportConfig = Field(default_factory=HandoffReportConfig)
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     external_skills: ExternalSkillsConfig = Field(default_factory=ExternalSkillsConfig)
+    memory_reranker: MemoryReranker | None = Field(default=None, exclude=True)
 
     @model_validator(mode="before")
     @classmethod

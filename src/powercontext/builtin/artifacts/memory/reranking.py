@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -86,6 +86,7 @@ class MemoryRerankDecision:
     used_fallback: bool = False
 
 
+@runtime_checkable
 class MemoryReranker(Protocol):
     """Select final Memory hits from one already ordered coarse pool."""
 
