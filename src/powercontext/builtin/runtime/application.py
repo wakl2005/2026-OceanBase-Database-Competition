@@ -487,6 +487,7 @@ class ScopedSourceApplication:
                         )
                         if span is not None:
                             span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
+                    self._wake_count_processing()
             except BaseValueConflictError as error:
                 raise SourceConflictError("identity", error.identity) from None
             return SourceReceipt(
@@ -505,7 +506,32 @@ class ScopedSourceApplication:
                 )
                 if span is not None:
                     span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
+            self._wake_count_processing()
             return SourceReceipt(source_ref=context.sources.catalog.as_ref(source), sequence=sequence)
+
+
+    def _wake_count_processing(self) -> None:
+        """Wake the processing Supervisor when a Source count threshold was reached."""
+
+        supervisor = self._runtime.artifact_processing_supervisor
+        thresholds = self._runtime._source_count_thresholds
+        if supervisor is None or not thresholds:
+            return
+        for binding_name in thresholds:
+            try:
+                supervisor.wake(binding_name)
+            except Exception as error:
+                log_safely(
+                    logger,
+                    logging.WARNING,
+                    "Source count trigger wake failed",
+                    exc_info=error,
+                    extra={
+                        "event": "source_count_trigger.wake_failed",
+                        "outcome": "failed",
+                        "binding_name": binding_name,
+                    },
+                )
 
 
 class SourceApplication:
@@ -2993,6 +3019,7 @@ class BuiltinRuntime:
         capabilities: RuntimeCapabilities,
         code_service: CodeService | None = None,
         source_window_limit: int = 100,
+        source_count_thresholds: Mapping[str, int] | None = None,
         context_assembly_max_entries: int = 8,
         recall_sufficiency_policy: RecallSufficiencyPolicy | None = None,
         scope_cache_size: int = DEFAULT_SCOPE_CACHE_SIZE,
@@ -3097,6 +3124,7 @@ class BuiltinRuntime:
         self._scheduled_source_runner = scheduled_source_runner
         self._scheduled_experience_runner = scheduled_experience_runner
         self.source_window_limit = source_window_limit
+        self._source_count_thresholds = dict(source_count_thresholds or {})
         self.context_assembly_max_entries = context_assembly_max_entries
         self.recall_sufficiency_policy = recall_sufficiency_policy
         self._scope_cache = ScopeCache(

@@ -38,6 +38,7 @@ from powercontext.builtin.persistence.errors import (
     RepositoryNotFoundError,
     StoredPayloadConflictError,
 )
+from powercontext.builtin.persistence.cursors import SourceCursorRepository
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
 from powercontext.builtin.persistence.tables import SOURCE_JOURNAL_HEADS_TABLE, SOURCES_TABLE
 from powercontext.builtin.sources.content import ContentSource
@@ -79,7 +80,10 @@ class SourceRepository:
         self,
         definitions: SourceDefinitionRegistry | Iterable[_AnySourceAdapter],
         /,
+        *,
+        count_thresholds: Mapping[str, int] | None = None,
     ) -> None:
+        self._count_thresholds = dict(count_thresholds or {})
         self._registry = (
             definitions
             if isinstance(definitions, SourceDefinitionRegistry)
@@ -171,7 +175,26 @@ class SourceRepository:
         intents = ArtifactProcessingIntentRepository()
         for binding_name in SOURCE_PROCESSING_BINDINGS:
             await intents.mark_dirty(connection, scope_id, binding_name)
+        await self._request_count_triggers(connection, scope_id, position)
         return StoredSource(ref=ref, value=source, journal_position=position), True
+
+    async def _request_count_triggers(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        journal_position: int,
+    ) -> None:
+        """Request one Family invocation when enough new Sources are pending."""
+
+        if not self._count_thresholds:
+            return
+        intents = ArtifactProcessingIntentRepository()
+        cursors = SourceCursorRepository()
+        for binding_name, threshold in self._count_thresholds.items():
+            stored = await cursors.load(connection, scope_id, binding_name)
+            consumed = 0 if stored is None else stored.cursor.sequence
+            if journal_position - consumed >= threshold:
+                await intents.request(connection, scope_id, binding_name)
 
     async def get(
         self,

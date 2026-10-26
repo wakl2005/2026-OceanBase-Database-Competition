@@ -137,6 +137,7 @@ from powercontext.builtin.runtime.decision_model import (
     FailOpenDecisionModel,
     LLMDecisionModel,
 )
+from powercontext.builtin.triggers import SOURCE_WINDOW_TRIGGER_NAME
 from powercontext.builtin.runtime.family_processing import FAMILY_BINDINGS, FamilyWorkerSpec, run_family_worker
 from powercontext.builtin.runtime.memory_write_gate import build_memory_write_gate
 from powercontext.builtin.runtime.models import MemorySearchMode, RuntimeCapabilities
@@ -600,6 +601,7 @@ async def open_builtin_runtime(
                     prompts=dict(contexts.prompt_registry.capabilities),
                 ),
                 source_window_limit=config.runtime.source_window_limit,
+                source_count_thresholds=_source_count_thresholds(config.runtime),
                 context_assembly_max_entries=config.runtime.context_assembly_max_entries,
                 recall_sufficiency_policy=RecallSufficiencyPolicy.from_runtime_config(config.runtime),
                 scope_cache_size=config.runtime.scope_cache_size,
@@ -783,6 +785,7 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
                 max_workers=getattr(config.runtime, f"{prefix}_max_workers"),
                 worker_timeout_seconds=getattr(config.runtime, f"{prefix}_worker_timeout_seconds"),
                 automatic_processing_interval=None if interval is None else timedelta(seconds=float(interval)),
+                source_count_threshold=getattr(config.runtime, f"{prefix}_source_count_threshold", None),
                 cron=config.runtime.profile_cron
                 if family == "profile" and config.runtime.profile_schedule_enabled
                 else None,
@@ -802,6 +805,17 @@ def _validate_processing_registrations(configured: Sequence[ArtifactProcessingBi
         identifiers = [getattr(binding, attribute) for binding in configured]
         if len(identifiers) != len(set(identifiers)):
             raise BuiltinConfigurationError("artifact-processing-families")
+
+
+def _source_count_thresholds(runtime: RuntimeConfig) -> dict[str, int]:
+    """Map every configured Source count threshold to its processing Family."""
+
+    thresholds: dict[str, int] = {}
+    if runtime.memory_source_count_threshold is not None:
+        thresholds[SOURCE_WINDOW_TRIGGER_NAME] = runtime.memory_source_count_threshold
+    if runtime.topic_memory_source_count_threshold is not None:
+        thresholds[TOPIC_MEMORY_SOURCE_WINDOW_BINDING] = runtime.topic_memory_source_count_threshold
+    return thresholds
 
 
 def _topic_memory_processing_available(
@@ -953,6 +967,8 @@ async def open_builtin_contexts(
                 model_usage_write_timeout_seconds=config.runtime.model_usage_write_timeout_seconds,
                 model_usage_flush_timeout_seconds=config.runtime.model_usage_flush_timeout_seconds,
                 source_registry=source_registry,
+            memory_source_count_threshold=config.runtime.memory_source_count_threshold,
+            topic_memory_source_count_threshold=config.runtime.topic_memory_source_count_threshold,
                 cursor_secret=cursor_secret,
                 tracing=tracing,
             )
@@ -1030,6 +1046,8 @@ async def open_builtin_contexts(
             model_usage_write_timeout_seconds=config.runtime.model_usage_write_timeout_seconds,
             model_usage_flush_timeout_seconds=config.runtime.model_usage_flush_timeout_seconds,
             source_registry=source_registry,
+            memory_source_count_threshold=config.runtime.memory_source_count_threshold,
+            topic_memory_source_count_threshold=config.runtime.topic_memory_source_count_threshold,
             cursor_secret=cursor_secret,
             tracing=tracing,
         )

@@ -110,6 +110,7 @@ class ArtifactProcessingBinding:
     max_workers: int = 1
     worker_timeout_seconds: float = 600.0
     automatic_processing_interval: timedelta | None = None
+    source_count_threshold: int | None = None
     cron: str | None = None
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
@@ -131,6 +132,8 @@ class ArtifactProcessingBinding:
             raise ValueError("max_workers must be a positive integer")  # noqa: TRY003
         if self.worker_timeout_seconds <= 0:
             raise ValueError("worker_timeout_seconds must be positive")  # noqa: TRY003
+        if self.source_count_threshold is not None and self.source_count_threshold < 1:
+            raise ValueError("source_count_threshold must be positive")  # noqa: TRY003
         if self.automatic_processing_interval is not None:
             if self.automatic_processing_interval.total_seconds() <= 0:
                 raise ValueError("automatic interval must be positive")  # noqa: TRY003
@@ -639,6 +642,11 @@ class ArtifactProcessingSupervisor:
     async def _discover(self, state: _FamilyState) -> None:
         binding = state.binding
         loop = asyncio.get_running_loop()
+        if binding.source_count_threshold is not None:
+            # A count trigger can be raised by any Source write, so this Family
+            # keeps checking its durable request counters on every tick.
+            state.discovery_pending = True
+            state.next_discovery_at = loop.time() + self._tick
         if not state.reconcile_complete and binding.pending_provider is not None:
             state.reconcile_after = await binding.pending_provider.reconcile(
                 state.reconcile_after, _DISCOVERY_PAGE_SIZE, fence=self._require_current_fence()
@@ -1095,6 +1103,10 @@ class ArtifactProcessingSupervisor:
                 deadlines.append(state.next_schedule_at)
             if state.discovery_pending or state.scan_in_progress or not state.reconcile_complete or state.degraded:
                 deadlines.append(max(now, state.next_discovery_at))
+            if state.binding.source_count_threshold is not None:
+                # A count trigger can be raised by any Source write, so this
+                # Family keeps checking its durable request counters.
+                deadlines.append(now + self._tick)
         return None if not deadlines else max(0.001, min(deadlines) - now)
 
     def _log_failure(

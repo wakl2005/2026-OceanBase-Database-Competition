@@ -120,6 +120,13 @@ class RuntimeConfig(BaseModel):
                 normalized[old] = normalized[new]
         return normalized
 
+    @field_validator("memory_source_count_threshold", "topic_memory_source_count_threshold", mode="before")
+    @classmethod
+    def validate_source_count_threshold(cls, value: Any) -> Any:
+        if value is None or (isinstance(value, int) and not isinstance(value, bool) and value >= 1):
+            return value
+        raise ValueError("Source count thresholds must be positive integers")  # noqa: TRY003
+
     @field_validator(
         "memory_max_workers",
         "topic_memory_max_workers",
@@ -217,6 +224,8 @@ class RuntimeConfig(BaseModel):
     artifact_processing_role: Literal["all", "api", "background"] = "all"
     artifact_processing_supervisor_mode: Literal["global", "dedicated"] = "global"
     artifact_processing_families: tuple[str, ...] | None = None
+    memory_source_count_threshold: int | None = None
+    topic_memory_source_count_threshold: int | None = None
     memory_max_workers: int = Field(default=1, ge=1)
     topic_memory_max_workers: int = Field(default=10, ge=1)
     experience_max_workers: int = Field(default=1, ge=1)

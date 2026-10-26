@@ -537,6 +537,8 @@ class RelationalContexts:
         handoff_artifact_id: str = "handoff",
         memory_artifact_id: str = "memory",
         source_registry: SourceDefinitionRegistry | None = None,
+        memory_source_count_threshold: int | None = None,
+        topic_memory_source_count_threshold: int | None = None,
         cursor_secret: bytes | None = None,
         tracing: RuntimeTracing | None = None,
         prompt_registry: PromptRegistry | None = None,
@@ -554,7 +556,12 @@ class RelationalContexts:
         self.index = NoMemoryIndex() if index is None else index
         self.topic_memory_index = NoTopicMemoryIndex() if topic_memory_index is None else topic_memory_index
         self.experience_index = NoExperienceIndex() if experience_index is None else experience_index
-        source_repository = SourceRepository(self.source_registry)
+        count_thresholds: dict[str, int] = {}
+        if memory_source_count_threshold is not None:
+            count_thresholds[SOURCE_WINDOW_TRIGGER_NAME] = memory_source_count_threshold
+        if topic_memory_source_count_threshold is not None:
+            count_thresholds[TOPIC_MEMORY_SOURCE_WINDOW_BINDING] = topic_memory_source_count_threshold
+        source_repository = SourceRepository(self.source_registry, count_thresholds=count_thresholds)
         artifact_repository = ArtifactRepository(
             (Handoff, Memory, Experience, Skill, Profile, Prompt, TopicMemory),
             sources=source_repository,
