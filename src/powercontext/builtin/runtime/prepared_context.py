@@ -320,20 +320,26 @@ class PreparedContextBuilder:
                     order += 1
         if not spans:
             return None, (), (), omissions
-        _score_evidence_spans(spans, request.query)
-        best = max(span.score for span in spans)
-        floor = best * 0.4
-        ranked = sorted(
-            (span for span in spans if span.score >= floor and span.score > 0),
-            key=lambda span: (-span.score, span.order),
-        )
-        if not ranked:
-            ranked = [spans[0]]
+        weights = _score_evidence_spans(spans, request.query)
+        ranked = sorted(spans, key=lambda span: (-span.score, span.order))
         items: list[_EvidenceItem] = []
         fragments: list[PreparedContextFragment] = []
         origins: list[PreparedContextOrigin] = []
         for span in ranked:
-            item = _evidence_item(span)
+            item = _evidence_item(span, span.start, span.end)
+            if len(_render_evidence((*items, item)).encode("utf-8")) <= request.max_bytes:
+                items.append(item)
+                fragments.append(item.fragment)
+                origins.append(item.origin)
+                continue
+            # The whole span does not fit the remaining budget. Its most relevant
+            # contiguous window still carries literal evidence, so it is kept
+            # instead of dropping the span altogether.
+            budget = _remaining_content_budget(items, request.max_bytes)
+            window = _best_evidence_window(span, weights, budget)
+            if window is None:
+                continue
+            item = _evidence_item(span, window[0], window[1])
             if len(_render_evidence((*items, item)).encode("utf-8")) > request.max_bytes:
                 continue
             items.append(item)
@@ -821,7 +827,10 @@ def _truncate_utf8(text: str, byte_budget: int) -> str:
     return f"{encoded_prefix.decode('utf-8', errors='ignore')}{_ELLIPSIS}"
 
 
-_EVIDENCE_TOKEN = re.compile(r"[a-z0-9]+")
+_EVIDENCE_TOKEN = re.compile(r"[a-z]+|\d+")
+_EVIDENCE_BM25_K1 = 1.2
+_EVIDENCE_BM25_B = 0.75
+_EVIDENCE_PHRASE_BONUS = 1.5
 _EVIDENCE_STOPWORDS = frozenset(
     {
         "a",
@@ -904,14 +913,14 @@ class _EvidenceItem:
     fragment: PreparedContextFragment
 
 
-def _evidence_item(span: _EvidenceSpan) -> _EvidenceItem:
+def _evidence_item(span: _EvidenceSpan, start: int, end: int) -> _EvidenceItem:
     hit = span.hit
     address = MemoryEntryAddress(
         memory=ArtifactAddress(scope_id=span.scope_id, artifact=hit.memory_ref),
         entry_id=hit.entry_id,
         entry_version_id=hit.entry_version_id,
     )
-    text = hit.text[span.start : span.end]
+    text = hit.text[start:end]
     return _EvidenceItem(
         citation={
             "scope_id": span.scope_id,
@@ -981,43 +990,118 @@ def _sentence_spans(text: str) -> tuple[tuple[int, int], ...]:
 
 
 def _evidence_terms(query: str) -> tuple[str, ...]:
-    """Return the distinct content terms of one query."""
+    """Return the distinct content terms of one query, in the original order."""
 
-    return tuple(
-        dict.fromkeys(
-            token
-            for token in _EVIDENCE_TOKEN.findall(query.lower())
-            if token not in _EVIDENCE_STOPWORDS
-        )
-    )
+    terms: list[str] = []
+    for token in _EVIDENCE_TOKEN.findall(query.lower()):
+        if token in _EVIDENCE_STOPWORDS or token in terms:
+            continue
+        terms.append(token)
+    return tuple(terms)
 
 
-def _score_evidence_spans(spans: list[_EvidenceSpan], query: str) -> None:
-    """Score every span by the inverse-frequency query terms it contains."""
+def _evidence_phrases(query: str) -> tuple[str, ...]:
+    """Return the literal word pairs of one query, in the original word order."""
+
+    tokens = _EVIDENCE_TOKEN.findall(query.lower())
+    phrases: list[str] = []
+    for index in range(len(tokens) - 1):
+        left, right = tokens[index], tokens[index + 1]
+        if left in _EVIDENCE_STOPWORDS and right in _EVIDENCE_STOPWORDS:
+            continue
+        phrase = f"{left} {right}"
+        if phrase not in phrases:
+            phrases.append(phrase)
+    return tuple(phrases)
+
+
+def _contains_phrase(tokens: Sequence[str], phrase: str) -> bool:
+    """Report whether one literal phrase appears in a token sequence."""
+
+    parts = phrase.split(" ")
+    width = len(parts)
+    if width < 2 or len(tokens) < width:
+        return False
+    for index in range(len(tokens) - width + 1):
+        if list(tokens[index : index + width]) == parts:
+            return True
+    return False
+
+
+def _score_evidence_spans(spans: list[_EvidenceSpan], query: str) -> dict[str, float]:
+    """Score every span with BM25 and literal phrase matches."""
 
     terms = _evidence_terms(query)
     if not terms:
-        return
+        return {}
+    phrases = _evidence_phrases(query)
     documents = [
-        frozenset(_EVIDENCE_TOKEN.findall(span.hit.text[span.start : span.end].lower()))
-        for span in spans
+        _EVIDENCE_TOKEN.findall(span.hit.text[span.start : span.end].lower()) for span in spans
     ]
+    lengths = [len(document) for document in documents]
+    average = (sum(lengths) / len(lengths)) if lengths else 1.0
     frequency: Counter[str] = Counter()
     for document in documents:
-        frequency.update(document.intersection(terms))
+        frequency.update(set(document).intersection(terms))
     total = len(documents)
-    bigrams = tuple(
-        (terms[index], terms[index + 1]) for index in range(len(terms) - 1)
-    )
-    lowered = [span.hit.text[span.start : span.end].lower() for span in spans]
+    weights = {
+        term: math.log(1.0 + (total - frequency.get(term, 0) + 0.5) / (frequency.get(term, 0) + 0.5))
+        for term in terms
+    }
     for index, span in enumerate(spans):
         document = documents[index]
-        score = sum(
-            math.log((1 + total) / (1 + frequency.get(term, 0)))
-            for term in terms
-            if term in document
-        )
-        for left, right in bigrams:
-            if f"{left} {right}" in lowered[index]:
-                score += math.log((1 + total) / (1 + frequency.get(left, 0)))
+        counts = Counter(document)
+        length = lengths[index]
+        score = 0.0
+        for term in terms:
+            frequency_in_span = counts.get(term, 0)
+            if not frequency_in_span:
+                continue
+            denominator = frequency_in_span + _EVIDENCE_BM25_K1 * (
+                1.0 - _EVIDENCE_BM25_B + _EVIDENCE_BM25_B * length / average
+            )
+            score += weights[term] * frequency_in_span * (_EVIDENCE_BM25_K1 + 1.0) / denominator
+        for phrase in phrases:
+            if _contains_phrase(document, phrase):
+                score += _EVIDENCE_PHRASE_BONUS
         span.score = score
+    return weights
+
+
+def _remaining_content_budget(items: Sequence[_EvidenceItem], max_bytes: int) -> int:
+    """Return the bytes still available for one more literal fragment."""
+
+    rendered = len(_render_evidence(items).encode("utf-8"))
+    used = sum(len(item.content.encode("utf-8")) for item in items)
+    return max_bytes - (rendered - used)
+
+
+def _best_evidence_window(
+    span: _EvidenceSpan,
+    weights: dict[str, float],
+    max_bytes: int,
+) -> tuple[int, int] | None:
+    """Return the most relevant contiguous window of one span that fits the budget."""
+
+    if max_bytes <= 0:
+        return None
+    text = span.hit.text
+    tokens = [
+        (match.group(0), match.start(), match.end())
+        for match in _EVIDENCE_TOKEN.finditer(text, span.start, span.end)
+    ]
+    if not tokens:
+        return None
+    best: tuple[float, int, int] | None = None
+    left = 0
+    for right in range(len(tokens)):
+        while left <= right and len(text[tokens[left][1] : tokens[right][2]].encode("utf-8")) > max_bytes:
+            left += 1
+        if left > right:
+            break
+        score = sum(weights.get(token, 0.0) for token, _, _ in tokens[left : right + 1])
+        if best is None or score > best[0]:
+            best = (score, tokens[left][1], tokens[right][2])
+    if best is None:
+        return None
+    return best[1], best[2]
