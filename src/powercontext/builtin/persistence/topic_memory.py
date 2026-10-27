@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from sqlalchemy import and_, delete, func, insert, or_, select, update
@@ -54,6 +56,7 @@ from powercontext.builtin.persistence.supervision import database_utc_now
 from powercontext.builtin.persistence.tables import (
     ARTIFACT_HEADS_TABLE,
     ARTIFACTS_TABLE,
+    SOURCE_LIFECYCLE_NODE_TABLE,
     TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE,
     TOPIC_MEMORY_ACTIVE_TOPICS_TABLE,
     TOPIC_MEMORY_RETRIEVAL_SHAPE_TABLE,
@@ -489,6 +492,15 @@ class TopicMemoryRepository:
         channels = await self.index.search(connection, scope_id, request)
         await self._check_retrieval_shape(connection)
         outcome = _fuse_topic_memory_rankings(query, channels, limit, mode=used_mode, admission=admission)
+        unsupported = await self._unsupported_topics(connection, scope_id)
+        if unsupported:
+            # A Topic Memory revision without supporting evidence leaves the
+            # result. Its exact revision stays readable, so a past result can
+            # still be checked against the revision it named.
+            outcome = replace(
+                outcome,
+                hits=tuple(hit for hit in outcome.hits if hit.artifact_ref.artifact_id not in unsupported),
+            )
         return TopicMemorySearchResult(
             mode=used_mode,
             hits=outcome.hits,
@@ -500,6 +512,35 @@ class TopicMemoryRepository:
                 rejected=outcome.rejected,
             ),
         )
+
+    async def _unsupported_topics(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        /,
+    ) -> frozenset[str]:
+        """Return the artifact ids of the Topic Memory nodes without support.
+
+        The lookup joins the one transaction that already serves this search, so
+        a Scope without a registered lifecycle graph costs a single empty read.
+        """
+
+        statement = select(SOURCE_LIFECYCLE_NODE_TABLE.c.reference).where(
+            SOURCE_LIFECYCLE_NODE_TABLE.c.scope_id == scope_id,
+            SOURCE_LIFECYCLE_NODE_TABLE.c.kind == "topic",
+            SOURCE_LIFECYCLE_NODE_TABLE.c.available.is_(False),
+        )
+        rows = (await connection.execute(statement)).scalars().all()
+        artifact_ids: set[str] = set()
+        for payload in rows:
+            try:
+                data = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+            artifact_id = data.get("artifact_ref", {}).get("artifact_id")
+            if isinstance(artifact_id, str) and artifact_id:
+                artifact_ids.add(artifact_id)
+        return frozenset(artifact_ids)
 
     async def _activate(
         self,

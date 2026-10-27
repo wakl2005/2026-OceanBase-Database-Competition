@@ -2714,7 +2714,6 @@ class ScopedTopicMemoryApplication:
                     query_embedding,
                     embedding_timeout_seconds,
                 )
-        result = await self._without_unsupported_topics(result)
         observer = self._runtime._topic_memory_search_observer
         if observer is not None:
             try:
@@ -2732,28 +2731,6 @@ class ScopedTopicMemoryApplication:
                     },
                 )
         return result
-
-    async def _without_unsupported_topics(self, result: TopicMemorySearchResult) -> TopicMemorySearchResult:
-        """Drop the Topic Memory hits whose evidence no longer supports them.
-
-        A Topic Memory revision without support leaves the search result and the
-        prepared Context, while its exact ArtifactRef keeps resolving, so a past
-        result can still be checked against the revision it named.
-        """
-
-        lifecycle = self._runtime.lifecycle
-        if lifecycle is None:
-            return result
-        try:
-            unsupported = await lifecycle.for_scope(self.scope_id).inactive_topic_references()
-        except Exception:
-            return result
-        if not unsupported or not result.hits:
-            return result
-        kept = tuple(hit for hit in result.hits if hit.artifact_ref.artifact_id not in unsupported)
-        if len(kept) == len(result.hits):
-            return result
-        return result.model_copy(update={"hits": kept})
 
     async def _search_with_embedding(
         self,
