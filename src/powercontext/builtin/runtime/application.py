@@ -27,6 +27,7 @@ from time import perf_counter
 from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import BaseModel, JsonValue, ValidationError
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from powercontext._logging import log_safely
 from powercontext.artifacts import ArtifactRef
@@ -143,7 +144,9 @@ from powercontext.builtin.persistence.artifact_governance import (
     ArtifactGovernance,
     ArtifactLifecycleState,
 )
+from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.skill_publications import SkillPublication
+from powercontext.builtin.persistence.source_lifecycle import SourceLifecycleRepository
 from powercontext.builtin.publication import ArtifactPublicationApplication
 from powercontext.builtin.records import (
     ArtifactCreated,
@@ -166,8 +169,8 @@ from powercontext.builtin.runtime._scope_cache import (
     ScopeCacheObserver,
     ScopeEvictor,
 )
-from powercontext.builtin.runtime.decision_model import DecisionModel
 from powercontext.builtin.runtime.context_pack import ContextPack, ContextPackDelta
+from powercontext.builtin.runtime.decision_model import DecisionModel
 from powercontext.builtin.runtime.errors import InvalidRuntimeRequestError, TopicMemoryProcessingUnavailableError
 from powercontext.builtin.runtime.models import (
     ApproveArtifactCandidateRequest,
@@ -248,6 +251,10 @@ from powercontext.builtin.runtime.recall_sufficiency import (
     RecallSufficiencyPolicy,
     build_recall_candidates,
     recall_effort,
+)
+from powercontext.builtin.runtime.source_lifecycle import (
+    SourceLifecycleApplication,
+    SourceLifecycleError,
 )
 from powercontext.builtin.runtime.statistics import RelationalScopedStatistics, overview_selection
 from powercontext.builtin.scope import ScopeApplication, ScopeDescriptor, ScopeSelection
@@ -2707,6 +2714,7 @@ class ScopedTopicMemoryApplication:
                     query_embedding,
                     embedding_timeout_seconds,
                 )
+        result = await self._without_unsupported_topics(result)
         observer = self._runtime._topic_memory_search_observer
         if observer is not None:
             try:
@@ -2724,6 +2732,28 @@ class ScopedTopicMemoryApplication:
                     },
                 )
         return result
+
+    async def _without_unsupported_topics(self, result: TopicMemorySearchResult) -> TopicMemorySearchResult:
+        """Drop the Topic Memory hits whose evidence no longer supports them.
+
+        A Topic Memory revision without support leaves the search result and the
+        prepared Context, while its exact ArtifactRef keeps resolving, so a past
+        result can still be checked against the revision it named.
+        """
+
+        lifecycle = self._runtime.lifecycle
+        if lifecycle is None:
+            return result
+        try:
+            unsupported = await lifecycle.for_scope(self.scope_id).inactive_topic_references()
+        except Exception:
+            return result
+        if not unsupported or not result.hits:
+            return result
+        kept = tuple(hit for hit in result.hits if hit.artifact_ref.artifact_id not in unsupported)
+        if len(kept) == len(result.hits):
+            return result
+        return result.model_copy(update={"hits": kept})
 
     async def _search_with_embedding(
         self,
@@ -3055,6 +3085,7 @@ class BuiltinRuntime:
         statistics_service: StatisticsServiceFactory | None = None,
         record_service: RecordService | None = None,
         prompt_service: PromptService | None = None,
+        lifecycle_database: AsyncDatabase | None = None,
         recall_token_estimator: RecallTokenEstimator | None = None,
         recall_effort_sink: RecallEffortSink | None = None,
         decision_model: DecisionModel | None = None,
@@ -3110,6 +3141,7 @@ class BuiltinRuntime:
         self._remote_skill_distribution = remote_skill_distribution
         self._statistics_service = statistics_service
         self._record_service = record_service
+        self._lifecycle_database = lifecycle_database
         self._prompt_service = prompt_service
         self._recall_token_estimator = recall_token_estimator
         self._recall_effort_sink = recall_effort_sink
@@ -3153,6 +3185,7 @@ class BuiltinRuntime:
         self.memory = MemoryApplication(self)
         self.topic_memory = TopicMemoryApplication(self)
         self.records = RecordApplication(self)
+        self.lifecycle = SourceLifecycleApplication(self)
         self.prompts = PromptApplication(self)
         self.review = ReviewApplication(self)
         self.skill = SkillApplication(self)
@@ -3402,6 +3435,78 @@ class BuiltinRuntime:
                 yield
             finally:
                 self._generation_owners.remove(task)
+
+    @asynccontextmanager
+    async def _lifecycle_transaction(self, scope_id: str) -> AsyncIterator[AsyncConnection]:
+        """Open one transaction over the Source lifecycle tables of a Scope."""
+
+        database = self._lifecycle_database
+        if database is None:
+            raise _RuntimeStateError("source-lifecycle-storage")
+        async with database.transaction() as connection:
+            yield connection
+
+    async def _require_source_reference(self, scope_id: str, source_ref: SourceRef) -> None:
+        """Report whether one registered Source reference can still be read."""
+
+        try:
+            await self.records.for_scope(scope_id).get_source(source_ref.source_type, source_ref.source_id)
+        except Exception as error:
+            raise SourceLifecycleError("unknown-source-reference") from error
+
+    async def _require_memory_citation(self, scope_id: str, citation: MemoryCitation) -> None:
+        """Report whether one registered Memory citation can still be read."""
+
+        try:
+            await self.memory.for_scope(scope_id).get(GetMemoryEntryRequest(citation=citation))
+        except Exception as error:
+            raise SourceLifecycleError("unknown-memory-citation") from error
+
+    async def _require_topic_reference(self, scope_id: str, reference: ArtifactRef) -> None:
+        """Report whether one registered Topic Memory revision can still be read."""
+
+        try:
+            await self.records.for_scope(scope_id).get_artifact_revision(
+                reference.family, reference.artifact_id, reference.revision
+            )
+        except Exception as error:
+            raise SourceLifecycleError("unknown-topic-reference") from error
+
+    async def _apply_lifecycle_availability(self, scope_id: str, active: set[str]) -> None:
+        """Reflect the propagated availability in the native Memory surface.
+
+        A Memory entry that lost its evidence leaves the active set, so it stops
+        answering searches and leaves the prepared Context. Its body and its
+        version are untouched, so an exact historical reference keeps resolving.
+        """
+
+        async with self._lifecycle_transaction(scope_id) as connection:
+            nodes = await SourceLifecycleRepository().nodes(connection, scope_id)
+        entries = [node for node in nodes.values() if node.kind == "memory"]
+        if not entries:
+            return
+        async with self._context(scope_id) as context, self._locked(scope_id):
+            service = context.artifacts.memory
+            current = await _head_or_none(service, context.artifacts.memory_artifact_id)
+            if current is None:
+                return
+            versions = {entry.entry_id: entry for entry in await service.entries(current)}
+            states = {item.entry_id: item.state for item in current.content.manifest.entries}
+            deactivate: list[Any] = []
+            reactivate: list[Any] = []
+            for node in entries:
+                citation = node.reference
+                version = versions.get(citation.entry_id)
+                if version is None or version.entry_version_id != citation.entry_version_id:
+                    continue
+                if node.node_id in active and states.get(citation.entry_id) != "active":
+                    reactivate.append(version)
+                elif node.node_id not in active and states.get(citation.entry_id) == "active":
+                    deactivate.append(version)
+            if deactivate:
+                await service.forget(current, entries=deactivate, reason="source-lifecycle")
+            if reactivate:
+                await service.reactivate(current, entries=reactivate, reason="source-lifecycle")
 
     @asynccontextmanager
     async def _context(
