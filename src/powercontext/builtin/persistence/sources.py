@@ -175,7 +175,13 @@ class SourceRepository:
         intents = ArtifactProcessingIntentRepository()
         for binding_name in SOURCE_PROCESSING_BINDINGS:
             await intents.mark_dirty(connection, scope_id, binding_name)
-        await self._request_count_triggers(connection, scope_id, position)
+        try:
+            await self._request_count_triggers(connection, scope_id, position)
+        except Exception:  # noqa: BLE001 - a count trigger must never fail a capture
+            # The count condition is an admission hint. A capture stays valid even
+            # when the trigger cannot be evaluated, so the failure is ignored here
+            # and the next Source write retries the evaluation.
+            pass
         return StoredSource(ref=ref, value=source, journal_position=position), True
 
     async def _request_count_triggers(

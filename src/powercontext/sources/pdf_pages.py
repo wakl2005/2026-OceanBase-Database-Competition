@@ -32,6 +32,9 @@ from powercontext.sources import TEXT_EVIDENCE_PROJECTION_KEY, AdapterSourceDefi
 from powercontext.sources.models import Source, SourceMaterialization
 
 PDF_PAGE_SOURCE_NAME = "pdf-page"
+_BM25_K1 = 1.2
+_BM25_B = 0.75
+_PHRASE_BONUS = 1.5
 _TERM_PATTERN = re.compile(r"[a-z]+|\d+")
 _STOPWORDS = frozenset(
     {
@@ -313,20 +316,40 @@ def _rank_pages(
     candidates: list[tuple[Any, tuple[str, int], str]],
     question: str,
 ) -> list[tuple[Any, tuple[str, int]]]:
-    """Rank candidate pages by offline query coverage of the question."""
+    """Rank candidate pages by BM25 plus a literal phrase bonus."""
 
     terms = _query_terms(question)
     if not terms:
         return [(citation, key) for citation, key, _ in candidates]
-    documents = [_terms(text) for _, _, text in candidates]
-    frequencies: Counter[str] = Counter()
+    documents = [Counter(_terms(text)) for _, _, text in candidates]
+    lengths = [sum(document.values()) for document in documents]
+    average = (sum(lengths) / len(lengths)) if lengths else 1.0
+    document_frequency: Counter[str] = Counter()
     for document in documents:
-        frequencies.update(set(document))
+        document_frequency.update(document.keys())
     total = len(documents)
-    weights = {term: _idf(frequencies.get(term, 0), total) for term in terms}
+    idf = {
+        term: math.log(1.0 + (total - document_frequency.get(term, 0) + 0.5) / (document_frequency.get(term, 0) + 0.5))
+        for term in terms
+    }
+    phrases = tuple(
+        f"{terms[index]} {terms[index + 1]}" for index in range(len(terms) - 1)
+    )
+    lowered = [text.lower() for _, _, text in candidates]
     scored: list[tuple[float, Any, tuple[str, int]]] = []
-    for (citation, key, _), document in zip(candidates, documents, strict=True):
-        scored.append((_score(document, terms, weights), citation, key))
+    for index, ((citation, key, _), document) in enumerate(zip(candidates, documents, strict=True)):
+        length = lengths[index]
+        score = 0.0
+        for term in terms:
+            frequency = document.get(term, 0)
+            if not frequency:
+                continue
+            denominator = frequency + _BM25_K1 * (1.0 - _BM25_B + _BM25_B * length / average)
+            score += idf[term] * frequency * (_BM25_K1 + 1.0) / denominator
+        for phrase in phrases:
+            if phrase in lowered[index]:
+                score += _PHRASE_BONUS
+        scored.append((score, citation, key))
     scored.sort(key=lambda item: (-item[0], item[2]))
     return [(citation, key) for _, citation, key in scored]
 
@@ -341,25 +364,6 @@ def _query_terms(question: str) -> tuple[str, ...]:
 
 def _terms(text: str) -> list[str]:
     return _TERM_PATTERN.findall(text.lower())
-
-
-def _idf(document_frequency: int, total: int) -> float:
-    if total <= 0:
-        return 0.0
-    return math.log((total + 1) / (document_frequency + 1)) + 1.0
-
-
-def _score(document: list[str], terms: tuple[str, ...], weights: dict[str, float]) -> float:
-    if not document:
-        return 0.0
-    counts = Counter(document)
-    available = sum(weight for term, weight in weights.items() if counts.get(term))
-    total = sum(weights.values())
-    if not total:
-        return 0.0
-    coverage = available / total
-    density = sum(weights[term] for term in terms if counts.get(term))
-    return coverage + 0.05 * density / total
 
 
 def _citation_of(record: Any) -> Any:

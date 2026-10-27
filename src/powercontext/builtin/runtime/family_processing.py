@@ -212,6 +212,16 @@ async def _process_family_invocation(  # noqa: C901 - one guarded dispatch per r
             )
             if result.held_count:
                 return ArtifactProcessingWorkerCompletion(held_count=result.held_count, hold_codes=result.hold_codes)
+            threshold = config.runtime.memory_source_count_threshold
+            if threshold is not None:
+                # The consumed window can still leave enough new Sources pending.
+                # The count condition is re-checked against the new cursor, so a
+                # busy Scope keeps processing while a quiet one waits.
+                await contexts.request_source_count_trigger(
+                    scope,
+                    binding_name=SOURCE_WINDOW_TRIGGER_NAME,
+                    threshold=threshold,
+                )
         elif assignment.artifact_family == "experience":
             await contexts.incubate_experience(
                 scope,

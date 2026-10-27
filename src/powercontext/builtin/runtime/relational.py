@@ -1376,6 +1376,30 @@ class RelationalContexts:
             tracing=self._tracing,
         ).flush(limit=limit, processing=processing, authorize_snapshot=authorize_snapshot, on_commit=on_commit)
 
+    async def request_source_count_trigger(
+        self,
+        scope_id: str,
+        *,
+        binding_name: str,
+        threshold: int,
+    ) -> bool:
+        """Request one more window when enough new Sources are still pending.
+
+        A Family that consumed a window re-checks its own cursor here: when the
+        remaining Sources still reach the threshold, the next window is requested
+        without waiting for new input.
+        """
+
+        async with self.database.transaction() as connection:
+            position = await self.repositories.sources.journal_position(connection, scope_id)
+            stored = await self.repositories.cursors.load(connection, scope_id, binding_name)
+            consumed = 0 if stored is None else stored.cursor.sequence
+            if position - consumed < threshold:
+                return False
+            intents = ArtifactProcessingIntentRepository()
+            await intents.request(connection, scope_id, binding_name)
+            return True
+
     async def incubate_experience(
         self,
         scope_id: str,
