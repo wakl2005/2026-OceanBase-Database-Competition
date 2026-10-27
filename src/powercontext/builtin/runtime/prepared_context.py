@@ -309,7 +309,7 @@ class PreparedContextBuilder:
         for candidates in memory_candidates:
             scope_id = candidates.scope_id or current_scope_id or ""
             for hit in candidates.hits:
-                if not hit.text.strip():
+                if not hit.text.strip() or hit.memory_ref is None:
                     continue
                 for start, end in _sentence_spans(hit.text):
                     if len(_EVIDENCE_TOKEN.findall(hit.text[start:end].lower())) < 3:
@@ -339,6 +339,10 @@ class PreparedContextBuilder:
             items.append(item)
             fragments.append(item.fragment)
             origins.append(item.origin)
+        if len(items) != len(fragments) or len(items) != len(origins):
+            # The rendered items, the fragments and the origins always describe the
+            # same selection, so a mismatch is a bug rather than a shorter context.
+            raise PreparedContextInvariantError("evidence-fragment-alignment")
         if not items:
             return None, (), (), omissions
         return _render_evidence(items), tuple(origins), omissions, tuple(fragments)
