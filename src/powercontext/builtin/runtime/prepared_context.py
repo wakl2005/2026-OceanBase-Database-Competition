@@ -25,6 +25,7 @@ from dataclasses import dataclass, replace
 from itertools import chain
 from typing import TypeVar
 
+from powercontext.limits import MAX_SCOPE_ID_LENGTH
 from powercontext.artifacts import ArtifactAddress, ArtifactRef
 from powercontext.builtin.artifacts.experience import Experience, ExperienceSearchHit, render_experience
 from powercontext.builtin.artifacts.memory.models import MemoryCitation, MemoryHit
@@ -308,6 +309,11 @@ class PreparedContextBuilder:
         order = 0
         for candidates in memory_candidates:
             scope_id = candidates.scope_id or current_scope_id or ""
+            if not _is_addressable_scope(scope_id):
+                # A fragment citation must address one Scope. A group without a
+                # usable Scope cannot produce one, so it is left out instead of
+                # failing the whole selection.
+                continue
             for hit in candidates.hits:
                 if not hit.text.strip() or hit.memory_ref is None:
                     continue
@@ -319,7 +325,24 @@ class PreparedContextBuilder:
                     )
                     order += 1
         if not spans:
-            return None, (), (), omissions
+            # No sentence carried enough tokens to be scored on its own. The whole
+            # body of a candidate is still literal evidence, so it is used as one
+            # span instead of returning an empty context.
+            for candidates in memory_candidates:
+                scope_id = candidates.scope_id or current_scope_id or ""
+                if not _is_addressable_scope(scope_id):
+                    continue
+                for hit in candidates.hits:
+                    if not hit.text.strip() or hit.memory_ref is None:
+                        continue
+                    spans.append(
+                        _EvidenceSpan(
+                            order=order, scope_id=scope_id, hit=hit, start=0, end=len(hit.text)
+                        )
+                    )
+                    order += 1
+            if not spans:
+                return None, (), (), omissions
         weights = _score_evidence_spans(spans, request.query)
         ranked = sorted(spans, key=lambda span: (-span.score, span.order))
         items: list[_EvidenceItem] = []
@@ -987,6 +1010,12 @@ def _sentence_spans(text: str) -> tuple[tuple[int, int], ...]:
             spans.append((position + offset, position + offset + len(stripped)))
         position = end
     return tuple(spans)
+
+
+def _is_addressable_scope(scope_id: str) -> bool:
+    """Report whether one Scope can address a fragment citation."""
+
+    return bool(scope_id) and scope_id == scope_id.strip() and len(scope_id) <= MAX_SCOPE_ID_LENGTH
 
 
 def _evidence_terms(query: str) -> tuple[str, ...]:
